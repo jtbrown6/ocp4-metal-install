@@ -82,7 +82,7 @@
 1. Install CentOS8 on the ocp-svc host
 
    - Remove the home dir partition and assign all free storage to '/'
-   - Optionally you can install the 'Guest Tools' package to have monitoring and reporting in the VMware ESXi dashboard
+   - Optionally you can install the 'Guest Tools' package to have monitoring and reporting in the VMware ESXi dashboard recommended
    - Enable the LAN NIC only to obtain a DHCP address from the LAN network and make note of the IP address (ocp-svc_IP_address) assigned to the vm
 
 1. Boot the ocp-svc VM
