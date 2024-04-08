@@ -38,6 +38,8 @@
 
 ## Prepare the 'Bare Metal' environment
 
+#### Install OCP Version 4.14
+Use this [link](https://mirror.openshift.com/pub/openshift-v4/dependencies/rhcos/4.14/4.14.0/) to install software files.
 > VMware ESXi used in this guide
 
 1. Copy the CentOS 8 iso to an ESXi datastore
