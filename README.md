@@ -1,3 +1,6 @@
+# Personal Note
+The information here is used as a delta between the `Personal\00HomeLab Projects\Homelab_Enterprise\02 OKD Config Guide`
+
 # OpenShift 4 Bare Metal Install - User Provisioned Infrastructure (UPI)
 
 - [OpenShift 4 Bare Metal Install - User Provisioned Infrastructure (UPI)](#openshift-4-bare-metal-install---user-provisioned-infrastructure-upi)
