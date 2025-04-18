@@ -279,24 +279,77 @@ To expose services within your K3s cluster using stable IP addresses on your int
 MetalLB is now installed and configured. When you create a Kubernetes Service of `Type=LoadBalancer`, MetalLB will automatically assign it an available IP from the `192.168.10.100-192.168.10.150` range, and the MetalLB speakers will make that IP reachable on your `192.168.10.0/24` network segment. The next part will cover deploying a sample application and configuring DNS/Certificates.
 ---
 
-## Part 7: Deploy Application, Configure DNS & Certificates
+## Part 7: Deploy Nginx Ingress & Sample Application
 
-With the cluster infrastructure (K3s, HAProxy, MetalLB) in place, let's deploy a sample application (Grafana) and make it securely accessible from your main LAN using its hostname (`grafana.komebacklabs.lan`).
+With the cluster infrastructure (K3s, HAProxy, MetalLB) in place, and having disabled the default Traefik ingress during K3s installation, we will now install the Nginx Ingress Controller. Afterwards, we'll deploy a sample application (Grafana) and make it securely accessible from your main LAN using its hostname (`grafana.komebacklabs.lan`) via Nginx Ingress.
 
-**Objective:** Deploy Grafana, expose it via a MetalLB LoadBalancer IP, configure Pi-hole DNS, create a TLS secret from custom certificates, and enable TLS termination within the cluster.
+**Objective:** Install Nginx Ingress Controller, deploy Grafana, expose Grafana via Nginx Ingress using a MetalLB LoadBalancer IP for the controller, configure Pi-hole DNS, create a TLS secret, and enable TLS termination via Nginx Ingress.
 
 **Prerequisites:**
 
-*   Working K3s cluster with MetalLB configured (Part 6 completed).
+*   Working K3s cluster with Traefik disabled and MetalLB configured (Part 6 completed).
 *   `kubectl` access configured.
+*   Helm installed on your client machine.
 *   Access to your Pi-hole admin interface.
 *   Your custom certificate files for `grafana.komebacklabs.lan` (e.g., `grafana.crt`, `grafana.key`) and the Root CA certificate (`ca.crt`) available on your client machine.
 
-### Step 7.1: Deploy Grafana (Example Application)
+### Step 7.1: Install Nginx Ingress Controller
 
-We'll deploy Grafana using a simple Deployment and Service manifest. For production, using the official Helm chart is recommended, but this illustrates the core concepts.
+We will install the official Nginx Ingress Controller using its Helm chart. This controller will create a `LoadBalancer` service that gets an IP from MetalLB, becoming the entry point for HTTP/HTTPS traffic into the cluster (forwarded by HAProxy).
 
-1.  **Create Grafana Manifest (`grafana-deployment.yaml`):** Create this file on your client machine.
+1.  **Add Nginx Ingress Helm Repository:**
+    ```bash
+    # On your client machine
+    helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
+    helm repo update
+    ```
+
+2.  **Install the Helm Chart:**
+    ```bash
+    # On your client machine
+    helm install nginx-ingress ingress-nginx/ingress-nginx \
+      --namespace ingress-nginx \
+      --create-namespace \
+      --set controller.service.type=LoadBalancer
+    ```
+    *   **Explanation:**
+        *   `helm install nginx-ingress ...`: Installs the chart with the release name `nginx-ingress`.
+        *   `--namespace ingress-nginx --create-namespace`: Installs the controller into its own dedicated namespace.
+        *   `--set controller.service.type=LoadBalancer`: Explicitly tells the chart to create a `LoadBalancer` type service for the controller. MetalLB will assign an IP to this service.
+
+3.  **Verify Nginx Ingress Installation:** Wait a few moments for the pods and service to be ready.
+    ```bash
+    # Check pods in the ingress-nginx namespace
+    kubectl get pods -n ingress-nginx -w
+
+    # Check the service and note its EXTERNAL-IP
+    kubectl get svc -n ingress-nginx nginx-ingress-ingress-nginx-controller -w
+    ```
+    Wait until the pods are `Running` and the `nginx-ingress-ingress-nginx-controller` service has an `EXTERNAL-IP` assigned from your MetalLB pool (e.g., `192.168.10.101`). **Make a note of this specific IP address.** Press Ctrl+C to exit the watches.
+
+4.  **(Recommended) Update HAProxy Backend:** For optimal routing, update your HAProxy configuration (`/etc/haproxy/haproxy.cfg` on `k8-svc`) so that the `http_ingress_backend` and `https_ingress_backend` sections point to the **EXTERNAL-IP** and corresponding ports (80/443) of the `nginx-ingress-ingress-nginx-controller` service you just noted, instead of pointing directly to worker nodes.
+    *   Example change in `haproxy.cfg` (replace `192.168.10.101` with the actual Nginx LoadBalancer IP):
+        ```cfg
+        backend http_ingress_backend
+            mode tcp
+            balance source
+            # Point to the Nginx Ingress Controller LoadBalancer Service IP
+            server nginx-ingress-lb 192.168.10.101:80 check
+
+        backend https_ingress_backend
+            mode tcp
+            balance source
+            # Point to the Nginx Ingress Controller LoadBalancer Service IP
+            server nginx-ingress-lb 192.168.10.101:443 check
+        ```
+    *   After editing `haproxy.cfg`, reload HAProxy: `sudo systemctl reload haproxy` on `k8-svc`.
+    *   *Note: While pointing HAProxy directly to worker nodes might work initially if Nginx pods land there, pointing to the stable LoadBalancer IP is more reliable.*
+
+### Step 7.2: Deploy Grafana (Example Application)
+
+This step remains largely the same, deploying Grafana and its internal `ClusterIP` service.
+
+1.  **Create Grafana Manifest (`grafana-deployment.yaml`):** Create this file on your client machine. *Note: The Service type is now `ClusterIP` as Nginx Ingress will handle external exposure.*
 
     ```yaml
     # grafana-deployment.yaml
@@ -339,36 +392,32 @@ We'll deploy Grafana using a simple Deployment and Service manifest. For product
       selector:
         app: grafana
       ports:
-        - name: http
+        - name: http # Service port name
           protocol: TCP
-          port: 443 # Expose HTTPS port externally
+          port: 3000 # Service port matches container port
           targetPort: 3000 # Target Grafana's internal HTTP port
-      type: LoadBalancer # Request an IP from MetalLB
-      # Optional: Specify a specific IP from the pool if desired
-      # loadBalancerIP: 192.168.10.100
+      type: ClusterIP # Only needs to be reachable within the cluster by Nginx Ingress
     ```
 
     *   **Explanation:**
-        *   `Deployment`: Defines how to run Grafana pods using the official image. Port 3000 is the default Grafana port. *Note: Persistence is not configured here for simplicity.*
-        *   `Service`: Exposes the Grafana deployment.
-            *   `selector`: Links the Service to the Deployment pods (`app: grafana`).
-            *   `type: LoadBalancer`: Tells Kubernetes to request an external IP from MetalLB.
-            *   `ports`: We map external port `443` (standard HTTPS) to the Grafana container's port `3000`. Even though Grafana runs on HTTP internally (port 3000), we expose the service on 443 because we intend to handle TLS termination at this service level (or via an Ingress later).
+        *   `Deployment`: Unchanged.
+        *   `Service`: Now uses `type: ClusterIP` because external access is handled by the Nginx Ingress Controller, not this service directly. The service port is set to `3000` to match Grafana's container port.
 
 2.  **Apply the Manifest:**
     ```bash
     kubectl apply -f grafana-deployment.yaml
     ```
 
-3.  **Verify Service and Get External IP:** Check the service status and wait for MetalLB to assign an IP.
+3.  **Verify Deployment and Service:**
     ```bash
-    kubectl get svc grafana-svc -w
+    kubectl get deployment grafana
+    kubectl get service grafana-svc
     ```
-    Wait until the `EXTERNAL-IP` column shows an IP address from your MetalLB pool (e.g., `192.168.10.100`). Note this IP address. Press Ctrl+C to exit.
+    Ensure the deployment is available and the service exists with a `CLUSTER-IP`.
 
-### Step 7.2: Configure Pi-hole DNS
+### Step 7.3: Configure Pi-hole DNS
 
-Now, point the desired hostname (`grafana.komebacklabs.lan`) to the HAProxy IP address (`192.168.1.89`) so that requests from your LAN clients are directed correctly.
+This step remains the same. Point the desired hostname (`grafana.komebacklabs.lan`) to the HAProxy IP address (`192.168.1.89`).
 
 1.  **Log in to Pi-hole:** Access your Pi-hole web admin interface.
 2.  **Navigate to Local DNS Records:** Find the section for managing local DNS A or CNAME records.
@@ -377,36 +426,30 @@ Now, point the desired hostname (`grafana.komebacklabs.lan`) to the HAProxy IP a
     *   **IP Address:** `192.168.1.89` (The **HAProxy** LAN IP)
 4.  **Save:** Add the record.
 
-    *   **Explanation:** When a client on your LAN queries Pi-hole for `grafana.komebacklabs.lan`, Pi-hole will now respond with `192.168.1.89`. The client will then send its HTTPS request to HAProxy. HAProxy's `https_ingress_frontend` (listening on `192.168.1.89:443`) will forward the TCP connection to the backend (initially the worker node `192.168.10.21:443`, but ultimately reaching the Grafana service's external IP `192.168.10.100` via K3s internal routing/kube-proxy). *Self-correction: HAProxy backend should ideally point directly to the MetalLB IP and port if known and stable, or rely on worker node routing.* For simplicity, pointing to workers is common initially.
+    *   **Explanation:** Client requests for `grafana.komebacklabs.lan` go to HAProxy (`192.168.1.89`). HAProxy forwards ports 80/443 to the Nginx Ingress Controller's LoadBalancer IP (e.g., `192.168.10.101`). Nginx Ingress then routes the request based on the hostname and path to the correct internal service (Grafana).
 
-### Step 7.3: Create Kubernetes TLS Secret
+### Step 7.4: Create Kubernetes TLS Secret
 
-Store your custom certificate and key in a Kubernetes secret so the cluster can use it for TLS termination.
+This step is unchanged. Store your custom certificate and key in a Kubernetes secret.
 
-1.  **Prepare Certificate Files:** Ensure you have the following files on your client machine where you run `kubectl`:
-    *   `grafana.crt`: The server certificate for `grafana.komebacklabs.lan`.
-    *   `grafana.key`: The private key corresponding to the server certificate.
-    *   *(Optional but recommended)* Ensure the `.crt` file contains the full certificate chain (server cert + intermediate CA cert(s)), excluding the Root CA.
-
-2.  **Create the Secret:** Use `kubectl create secret tls`.
+1.  **Prepare Certificate Files:** Ensure you have `grafana.crt` and `grafana.key` on your client machine.
+2.  **Create the Secret:**
     ```bash
     kubectl create secret tls grafana-tls \
       --cert=path/to/your/grafana.crt \
       --key=path/to/your/grafana.key \
       -n default # Use the same namespace as Grafana
     ```
-    Replace `path/to/your/` with the actual paths to your certificate files.
-
 3.  **Verify Secret Creation (Optional):**
     ```bash
     kubectl get secret grafana-tls -n default
     ```
 
-### Step 7.4: Configure TLS Termination (Example: Using Ingress)
+### Step 7.5: Configure TLS Termination via Nginx Ingress
 
-While you could configure Grafana itself for TLS, the standard Kubernetes way is to use an Ingress controller. K3s includes Traefik by default. Let's create an Ingress resource to manage TLS for Grafana.
+Create an Ingress resource that tells the Nginx Ingress Controller how to handle requests for `grafana.komebacklabs.lan`.
 
-1.  **Create Ingress Manifest (`grafana-ingress.yaml`):** Create this file on your client machine.
+1.  **Create Ingress Manifest (`grafana-ingress.yaml`):** Create this file on your client machine. Note the addition of `ingressClassName`.
 
     ```yaml
     # grafana-ingress.yaml
@@ -415,10 +458,11 @@ While you could configure Grafana itself for TLS, the standard Kubernetes way is
     metadata:
       name: grafana-ingress
       namespace: default # Use the same namespace as Grafana
-      # Optional annotations for specific ingress controllers (e.g., Traefik)
+      # Optional: Add Nginx specific annotations if needed later
       # annotations:
-      #   kubernetes.io/ingress.class: "traefik"
+      #   nginx.ingress.kubernetes.io/backend-protocol: "HTTP"
     spec:
+      ingressClassName: nginx # Specify Nginx Ingress Controller
       tls:
       - hosts:
           - grafana.komebacklabs.lan
@@ -428,53 +472,45 @@ While you could configure Grafana itself for TLS, the standard Kubernetes way is
         http:
           paths:
           - path: /
-            pathType: Prefix
+            pathType: Prefix # Match all paths under the host
             backend:
               service:
-                name: grafana-svc # Target the Grafana Service
+                name: grafana-svc # Target the Grafana ClusterIP Service
                 port:
-                  name: http # Target the service port named 'http' (which maps to 443 externally, 3000 internally)
+                  number: 3000 # Target the service port (which is 3000)
     ```
 
     *   **Explanation:**
-        *   `kind: Ingress`: Defines rules for routing external HTTP/HTTPS traffic to internal services.
-        *   `spec.tls`: Configures TLS termination.
-            *   `hosts`: Specifies the domain name(s) this TLS configuration applies to.
-            *   `secretName: grafana-tls`: Tells the Ingress controller (Traefik) to use the certificate and key from the `grafana-tls` secret for the specified hosts.
-        *   `spec.rules`: Defines routing rules.
-            *   `host`: Matches requests for `grafana.komebacklabs.lan`.
-            *   `http.paths`: Defines how to route paths under that host.
-            *   `backend.service`: Specifies the target service (`grafana-svc`) and port (`http`). Traefik will handle the connection to the service.
+        *   `kind: Ingress`: Defines routing rules.
+        *   `spec.ingressClassName: nginx`: **Crucial:** Tells Kubernetes that this Ingress resource should be handled by the installed Nginx Ingress Controller.
+        *   `spec.tls`: Configures TLS termination using the `grafana-tls` secret for the specified host.
+        *   `spec.rules`: Defines routing for `grafana.komebacklabs.lan`.
+        *   `backend.service`: Specifies the target service (`grafana-svc`) and the target service *port* (`3000`). Nginx Ingress will terminate TLS and forward plain HTTP traffic to `grafana-svc:3000`.
 
 2.  **Apply the Ingress Manifest:**
     ```bash
     kubectl apply -f grafana-ingress.yaml
     ```
 
-    *   **How it works now:** When HAProxy forwards the TCP connection for port 443 to the cluster (likely hitting Traefik's LoadBalancer service eventually), Traefik sees the incoming TLS connection for `grafana.komebacklabs.lan`. It uses the `grafana-tls` secret to terminate the TLS connection, then forwards the decrypted HTTP request to the `grafana-svc` on its internal port (3000).
+    *   **How it works now:** HAProxy forwards the TCP connection for port 443 to the Nginx Ingress Controller's LoadBalancer service. Nginx Ingress sees the incoming TLS connection for `grafana.komebacklabs.lan`, uses the `grafana-tls` secret to terminate TLS, and then forwards the decrypted HTTP request to the `grafana-svc` ClusterIP service on port 3000.
 
-### Step 7.5: Ensure Client Trusts Root CA
+### Step 7.6: Ensure Client Trusts Root CA
 
-For your browser to trust the custom certificate presented by the cluster, the client machine (where you access Grafana from) must trust your custom Root CA certificate (`ca.crt`).
+This step is unchanged. Import your `ca.crt` into your client machine's trust store.
 
-1.  **Import Root CA:** Import your `ca.crt` file into your operating system's trust store and/or your browser's certificate manager. The exact steps vary depending on your OS (Windows, macOS, Linux) and browser. Search for "import root ca certificate [your OS/browser]".
+1.  **Import Root CA:** Follow OS/browser specific steps.
 
-### Step 7.6: Test Access
+### Step 7.7: Test Access
 
-1.  **Clear DNS Cache (Optional):** On your client machine, you might need to clear the local DNS cache to ensure it picks up the new record from Pi-hole.
-    *   Windows: `ipconfig /flushdns`
-    *   macOS: `sudo dscacheutil -flushcache; sudo killall -HUP mDNSResponder`
-    *   Linux (systemd): `sudo systemd-resolve --flush-caches`
-2.  **Access Grafana:** Open your web browser and navigate to:
-    `https://grafana.komebacklabs.lan`
-3.  **Verify:**
-    *   You should see the Grafana login page.
-    *   The browser should show a secure connection (e.g., a padlock icon).
-    *   Check the certificate details in the browser - it should show the details from your custom `grafana.komebacklabs.lan` certificate and indicate it's trusted because the Root CA is installed.
+This step is unchanged.
+
+1.  **Clear DNS Cache (Optional):** Flush DNS on your client machine.
+2.  **Access Grafana:** Open `https://grafana.komebacklabs.lan` in your browser.
+3.  **Verify:** Check for Grafana login page and a valid, trusted HTTPS connection using your custom certificate.
 
 ---
 
-This completes the basic setup guide! You have deployed K3s, configured networking services on `k8-svc`, set up MetalLB, and exposed a sample application securely using HAProxy, Pi-hole, and custom certificates with TLS termination inside the cluster via Ingress. You can follow similar principles to deploy other applications. Remember to consult the `k3s-lab-overview.md` for a summary of the architecture and IP addresses.
+This completes the setup using Nginx Ingress Controller! You have deployed K3s (without Traefik), installed Nginx Ingress, configured MetalLB, and exposed Grafana securely using HAProxy, Pi-hole, Nginx Ingress, and custom certificates.
 ---
 
 ## Part 8: Configure Persistent Storage (NFS)
