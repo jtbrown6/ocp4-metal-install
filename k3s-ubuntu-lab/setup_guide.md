@@ -79,7 +79,8 @@ We will use the K3s installation script. The process involves initializing the f
     ```bash
     curl -sfL https://get.k3s.io | K3S_TOKEN=YOUR_SECURE_CLUSTER_SECRET sh -s - server \
         --cluster-init \
-        --tls-san 192.168.1.89
+        --tls-san 192.168.1.89 \
+        --disable traefik
     ```
     *   **Explanation:**
         *   `curl ... | sh -s -`: Downloads and executes the K3s installation script.
@@ -104,7 +105,8 @@ We will use the K3s installation script. The process involves initializing the f
     ```bash
     curl -sfL https://get.k3s.io | K3S_TOKEN=YOUR_SECURE_CLUSTER_SECRET sh -s - server \
         --server https://192.168.10.11:6443 \
-        --tls-san 192.168.1.89
+        --tls-san 192.168.1.89 \
+        --disable traefik
     ```
     *   **Explanation:**
         *   `K3S_TOKEN=...`: Use the *exact same* token defined in Step 1.
