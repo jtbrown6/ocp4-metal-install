@@ -511,9 +511,103 @@ This step is unchanged.
 ---
 
 This completes the setup using Nginx Ingress Controller! You have deployed K3s (without Traefik), installed Nginx Ingress, configured MetalLB, and exposed Grafana securely using HAProxy, Pi-hole, Nginx Ingress, and custom certificates.
+
 ---
 
-## Part 8: Configure Persistent Storage (NFS)
+## Part 8: Exposing Additional LoadBalancer Services via HAProxy
+
+While Part 7 demonstrated exposing applications via the Nginx Ingress Controller (recommended for standard HTTP/HTTPS traffic using hostnames), you might occasionally need to expose a non-HTTP service or provide direct access to a specific `LoadBalancer` service IP via a dedicated port on your HAProxy instance (`k8-svc`).
+
+This section details how to configure HAProxy on `k8-svc` to forward traffic from a specific port on its LAN IP (`192.168.1.89`) directly to a Kubernetes `LoadBalancer` service IP within the `192.168.10.0/24` network.
+
+**Objective:** Make a Kubernetes `LoadBalancer` service accessible from the main LAN (`192.168.1.0/24`) by mapping a unique port on `k8-svc` (`192.168.1.89`) to the service's internal LoadBalancer IP and port.
+
+**Prerequisites:**
+
+*   A Kubernetes service of `type: LoadBalancer` deployed in your cluster.
+*   MetalLB has assigned an `EXTERNAL-IP` to this service from your configured pool (e.g., `192.168.10.X`).
+*   SSH access to `k8-svc`.
+
+**Procedure:**
+
+Let's assume you have deployed a new service named `my-app-svc` in the `my-app-ns` namespace, and it received the LoadBalancer IP `192.168.10.140` and exposes port `1234`. We want to access this service via `http://192.168.1.89:8082` (or just `192.168.1.89:8082` if it's a non-HTTP TCP service).
+
+1.  **Identify Service IP and Port:** Confirm the `EXTERNAL-IP` and `PORT(S)` for your service:
+    ```bash
+    kubectl get svc my-app-svc -n my-app-ns
+    # Example Output:
+    # NAME         TYPE           CLUSTER-IP     EXTERNAL-IP      PORT(S)          AGE
+    # my-app-svc   LoadBalancer   10.43.X.Y      192.168.10.140   1234:30123/TCP   5m
+    ```
+    Note the `EXTERNAL-IP` (`192.168.10.140`) and the service port (`1234`).
+
+2.  **Choose HAProxy Port:** Select a unique, unused port on `k8-svc`'s LAN interface (`192.168.1.89`) that you will use to access the service externally. For this example, we'll use `8082`.
+
+3.  **SSH into `k8-svc`:**
+    ```bash
+    ssh user@192.168.1.89 # Or however you connect to k8-svc
+    ```
+
+4.  **Edit HAProxy Configuration:** Open the HAProxy configuration file for editing:
+    ```bash
+    sudo nano /etc/haproxy/haproxy.cfg
+    ```
+
+5.  **Add Frontend Block:** Add a new `frontend` section to listen on your chosen external port (`8082`).
+    *   Set `mode` to `http` if it's a web service, or `tcp` for generic TCP traffic.
+    *   Point `default_backend` to a corresponding new backend name (e.g., `my_app_backend`).
+
+    ```cfg
+    #---------------------------------------------------------------------
+    # Frontend: Direct My App Access (Port 8082)
+    #---------------------------------------------------------------------
+    frontend my_app_frontend
+        bind 192.168.1.89:8082 # Listen on LAN IP, chosen external port
+        mode http             # Use 'tcp' for non-HTTP services
+        option httplog        # Use 'tcplog' if mode is tcp
+        default_backend my_app_backend
+    ```
+
+6.  **Add Backend Block:** Add a new `backend` section with the name referenced in the frontend.
+    *   Set `mode` to match the frontend (`http` or `tcp`).
+    *   Add a `server` line pointing to the service's `EXTERNAL-IP` (`192.168.10.140`) and service port (`1234`).
+    *   Include `check` to enable health checks.
+
+    ```cfg
+    #---------------------------------------------------------------------
+    # Backend: Direct My App Access
+    #---------------------------------------------------------------------
+    backend my_app_backend
+        mode http             # Use 'tcp' if mode is tcp
+        balance roundrobin    # Or 'source' if session persistence is needed
+        # Point directly to the My App LoadBalancer service IP and Port
+        server my-app-lb 192.168.10.140:1234 check
+    ```
+
+7.  **Save and Close:** Save the changes to `/etc/haproxy/haproxy.cfg`.
+
+8.  **Reload HAProxy:** Apply the new configuration without dropping existing connections:
+    ```bash
+    sudo systemctl reload haproxy
+    ```
+    Check the status to ensure it reloaded successfully:
+    ```bash
+    sudo systemctl status haproxy
+    ```
+
+9.  **Test Access:** You should now be able to access your service from your main LAN via the HAProxy IP and the port you configured:
+    *   If `mode http`: `http://192.168.1.89:8082`
+    *   If `mode tcp`: Connect using a suitable client to `192.168.1.89:8082`
+
+**Considerations:**
+
+*   **Port Conflicts:** Ensure the port chosen on `192.168.1.89` (e.g., `8082`) is not already in use by HAProxy or another service on `k8-svc`.
+*   **Mode:** Use `mode tcp` for non-HTTP TCP services. Use `mode http` for HTTP services, which allows for more advanced HTTP-specific options later if needed (like header manipulation).
+*   **Ingress Controller:** Remember that for standard web applications, using the Nginx Ingress Controller (Part 7) is generally preferred. It allows you to use hostnames (like `my-app.komebacklabs.lan`) routed through standard ports (80/443) and handles TLS termination centrally. Exposing services directly via HAProxy ports is best reserved for specific use cases or non-HTTP traffic.
+
+---
+
+## Part 9: Configure Persistent Storage (NFS)
 
 For stateful applications (like databases, GitLab, Harbor data, etc.) to run effectively in Kubernetes, they need persistent storage that survives pod restarts. We will configure the `k8-svc` VM as an NFS server and deploy a dynamic provisioner in K3s that automatically creates PersistentVolumes (PVs) on this NFS share when applications request storage via PersistentVolumeClaims (PVCs).
 
@@ -524,7 +618,7 @@ For stateful applications (like databases, GitLab, Harbor data, etc.) to run eff
 *   Working K3s cluster accessible via `kubectl` (Part 7 completed).
 *   SSH access to `k8-svc` and all K3s nodes.
 
-### Step 8.1: Configure NFS Server on `k8-svc`
+### Step 9.1: Configure NFS Server on `k8-svc`
 
 1.  **Install NFS Server Package:**
     ```bash
@@ -580,7 +674,7 @@ For stateful applications (like databases, GitLab, Harbor data, etc.) to run eff
 
 7.  **Firewall Considerations (If Applicable):** Although you mentioned your firewall is open, in a firewalled environment, you would need to allow NFS traffic from the `192.168.10.0/24` network to the `k8-svc` VM (`192.168.10.1`). This typically involves allowing traffic on TCP/UDP port 2049 (NFS) and potentially ports for `rpcbind` (111) and `mountd` if they are not handled automatically by the `nfs-kernel-server` service rules.
 
-### Step 8.2: Install NFS Client on K3s Nodes
+### Step 9.2: Install NFS Client on K3s Nodes
 
 The K3s nodes need the NFS client utilities to be able to mount the NFS share.
 
@@ -592,7 +686,7 @@ The K3s nodes need the NFS client utilities to be able to mount the NFS share.
     ```
     *(Note: This might already be installed as part of Ubuntu Server, but running the command ensures it's present.)*
 
-### Step 8.3: Deploy NFS Subdir External Provisioner
+### Step 9.3: Deploy NFS Subdir External Provisioner
 
 This component runs inside Kubernetes, watches for PVCs, and automatically creates corresponding directories on the NFS share. Using Helm is the recommended way to install it.
 
@@ -641,7 +735,7 @@ This component runs inside Kubernetes, watches for PVCs, and automatically creat
     ```
     You should see `nfs-client` listed, potentially marked as `(default)`.
 
-### Step 8.4: Verify Dynamic Provisioning
+### Step 9.4: Verify Dynamic Provisioning
 
 Let's test if the setup works by creating a sample PVC.
 
